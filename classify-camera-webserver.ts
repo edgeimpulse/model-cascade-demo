@@ -1,12 +1,11 @@
-import { ImageClassifier, LinuxImpulseRunner, Ffmpeg, ICamera, Imagesnap, ModelInformation, getIps } from "edge-impulse-linux";
 import sharp from 'sharp';
 import express = require('express');
 import socketIO from 'socket.io';
 import http from 'http';
 import Path from 'path';
-import { RunnerHelloHasAnomaly } from "edge-impulse-linux";
 import OpenAI from "openai";
 import { highlightAnomalyInImage } from "./helpers";
+import { Ffmpeg, ICamera, ImageClassifier, Imagesnap, LinuxImpulseRunner, ModelInformation, RunnerHelloHasAnomaly } from './edge-impulse-linux/library';
 
 if (!process.env.OPENAI_API_KEY) {
     console.log('Missing OPENAI_API_KEY');
@@ -107,10 +106,9 @@ Reply with a very short response.`;
         await imageClassifier.start();
 
         let webserverPort = await startWebServer(model, camera, imageClassifier, port);
-        const ips = getIps();
         console.log('');
         console.log('Want to see a feed of the camera and live classification in your browser? ' +
-            'Go to http://' + (ips.length > 0 ? ips[0].address : 'localhost') + ':' + webserverPort);
+            'Go to http://localhost:' + webserverPort);
         console.log('');
     }
     catch (ex) {
@@ -130,16 +128,20 @@ function startWebServer(model: ModelInformation, camera: ICamera, imgClassifier:
 
     let cascadeEnabled = false;
     let prompt = BASE_PROMPT;
-    let thresholdOverride: number | undefined;
+    let thresholdObj = <{ id: number, min_anomaly_score: number } | undefined>
+        (model.modelParameters.thresholds || []).find(x => x.type === 'anomaly_gmm');
 
     // you can also get the actual image being classified from 'imageClassifier.on("result")',
     // but then you're limited by the inference speed.
     // here we get a direct feed from the camera so we guarantee the fps that we set earlier.
 
+    let lastFrameOriginalResolution: Buffer | undefined;
     let nextFrame = Date.now();
     let processingFrame = false;
     camera.on('snapshot', async (data) => {
         if (nextFrame > Date.now() || processingFrame) return;
+
+        lastFrameOriginalResolution = data;
 
         processingFrame = true;
 
@@ -231,13 +233,6 @@ function startWebServer(model: ModelInformation, camera: ICamera, imgClassifier:
     })();
 
     imgClassifier.on('result', async (ev, timeMs, imgAsJpg) => {
-
-        if (typeof thresholdOverride === 'number' && ev.result.visual_anomaly_grid) {
-            ev.result.visual_anomaly_grid = ev.result.visual_anomaly_grid.filter(g => {
-                return g.value > thresholdOverride!;
-            });
-        }
-
         io.emit('classification', {
             modelType: model.modelParameters.model_type,
             result: ev.result,
@@ -245,9 +240,13 @@ function startWebServer(model: ModelInformation, camera: ICamera, imgClassifier:
             additionalInfo: ev.info,
         });
 
-        imgToSendToOpenAI = await highlightAnomalyInImage(imgAsJpg, ev, model);
+        if (lastFrameOriginalResolution) {
+            imgToSendToOpenAI = await highlightAnomalyInImage(lastFrameOriginalResolution, ev, model);
 
-        // await sharp(imgToSendToOpenAI).toFile('tmp.png');
+            if (ev.result.visual_anomaly_grid && ev.result.visual_anomaly_grid.length > 0) {
+                await sharp(imgToSendToOpenAI).toFile('tmp.png');
+            }
+        }
 
         if ((ev.result.visual_anomaly_grid || []).length > 0 && !isRunningOpenAI) {
             anomalySeen = true;
@@ -259,10 +258,9 @@ function startWebServer(model: ModelInformation, camera: ICamera, imgClassifier:
 
     io.on('connection', socket => {
         socket.emit('hello', {
-            projectName: model.project.owner + ' / ' + model.project.name
-        });
-        socket.emit('hello', {
-            projectName: model.project.owner + ' / ' + model.project.name
+            projectName: model.project.owner + ' / ' + model.project.name,
+            canSetThreshold: !!thresholdObj,
+            defaultThreshold: thresholdObj?.min_anomaly_score,
         });
 
         socket.on('cascade-enable', () => {
@@ -276,12 +274,27 @@ function startWebServer(model: ModelInformation, camera: ICamera, imgClassifier:
             prompt = promptArg;
         });
 
-        socket.on('threshold-override', (thresholdOverrideArg: string) => {
-            if (thresholdOverrideArg && !isNaN(Number(thresholdOverrideArg))) {
-                thresholdOverride = Number(thresholdOverrideArg);
+        socket.on('threshold-override', async (thresholdOverrideArg: string) => {
+            try {
+                if (thresholdOverrideArg && !isNaN(Number(thresholdOverrideArg)) && thresholdObj) {
+                    let v = Number(thresholdOverrideArg);
+                    if (v === thresholdObj.min_anomaly_score) return;
+
+                    console.log(`Updating threshold, now: ${thresholdObj.min_anomaly_score}, setting to: ${v}...`);
+
+                    await imgClassifier.getRunner().setLearnBlockThreshold({
+                        id: thresholdObj.id,
+                        type: 'anomaly_gmm',
+                        min_anomaly_score: Number(thresholdOverrideArg),
+                    });
+
+                    thresholdObj.min_anomaly_score = Number(thresholdOverrideArg);
+
+                    console.log(`Updated threshold to ${v}`);
+                }
             }
-            else {
-                thresholdOverride = undefined;
+            catch (ex) {
+                console.log('Failed to set threshold:', ex);
             }
         });
     });

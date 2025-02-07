@@ -6,3 +6,5 @@ build/
 start.sh
 sync.sh
 tmp.png
+test.*
+test*.jpg

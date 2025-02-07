@@ -22,6 +22,7 @@ window.WebServer = async () => {
         enableCascade: document.querySelector('#enable-cascade'),
         prompt: document.querySelector('#prompt'),
         thresholdOverride: document.querySelector('#threshold-override'),
+        noThresholdInfo: document.querySelector('#no-threshold-info'),
     };
 
     const colors = [
@@ -96,7 +97,21 @@ window.WebServer = async () => {
     };
 
     socket.on('hello', (opts) => {
+        console.log('hello', opts);
+
         els.title.textContent = 'Model cascade demo';
+
+        if (!opts.canSetThreshold) {
+            els.thresholdOverride.value = '';
+            els.thresholdOverride.disabled = true;
+            els.noThresholdInfo.style.display = '';
+        }
+        else {
+            if (!els.thresholdOverride.value && typeof opts.defaultThreshold === 'number') {
+                els.thresholdOverride.value = Math.round((opts.defaultThreshold * 100) / 100).toString();
+            }
+            els.noThresholdInfo.style.display = 'none';
+        }
 
         switchView(els.views.captureCamera);
     });
